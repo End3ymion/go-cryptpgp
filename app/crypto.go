@@ -10,6 +10,7 @@ import (
 	"github.com/ProtonMail/gopenpgp/v3/constants"
 	"github.com/ProtonMail/gopenpgp/v3/crypto"
 	"github.com/ProtonMail/gopenpgp/v3/profile"
+	"github.com/diamondburned/gotk4/pkg/glib/v2"
 )
 
 // Algorithm constants to match UI combo box indices
@@ -23,6 +24,7 @@ const (
 // loadKeyring initializes the keyring directory and loads all valid keys into memory.
 // It skips duplicate keys and handles locked private keys by loading their public components
 // to ensure they are visible in the UI.
+// This function is designed to run in a background goroutine to avoid blocking the UI.
 func (m *PGPManager) loadKeyring() {
 	if err := os.MkdirAll(keyringPath, 0700); err != nil {
 		fmt.Printf("Error creating keyring dir: %v\n", err)
@@ -58,8 +60,11 @@ func (m *PGPManager) loadKeyring() {
 		}
 	}
 
-	m.refreshCombos()
-	m.refreshKeyList()
+	// UI updates must happen on the main GTK thread
+	glib.IdleAdd(func() {
+		m.refreshCombos()
+		m.refreshKeyList()
+	})
 }
 
 // GetKeyStatus inspects the on-disk key file to determine if a key is private and locked.

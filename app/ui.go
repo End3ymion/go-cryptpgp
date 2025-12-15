@@ -4,114 +4,133 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gotk3/gotk3/glib"
-	"github.com/gotk3/gotk3/gtk"
+	"github.com/diamondburned/gotk4/pkg/glib/v2"
+	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 )
+
+// Helper to show a popup dialog
+func (m *PGPManager) showDialog(msgType gtk.MessageType, message string) {
+	dialog := gtk.NewMessageDialog(
+		m.window,
+		gtk.DialogModal,
+		msgType,
+		gtk.ButtonsOK,
+	)
+	dialog.SetMarkup(message)
+	dialog.ConnectResponse(func(responseId int) {
+		dialog.Destroy()
+	})
+	dialog.Show()
+}
 
 // ---------------------------------------------------------
 // TAB 1: KEY GENERATION
 // ---------------------------------------------------------
 
-// createKeyGenTab builds the UI for generating new PGP key pairs.
 func (m *PGPManager) createKeyGenTab() {
-	box, _ := gtk.BoxNew(gtk.ORIENTATION_VERTICAL, 10)
-	box.SetMarginStart(20); box.SetMarginEnd(20); box.SetMarginTop(20); box.SetMarginBottom(20)
+	box := gtk.NewBox(gtk.OrientationVertical, 10)
+	box.SetMarginStart(20)
+	box.SetMarginEnd(20)
+	box.SetMarginTop(20)
+	box.SetMarginBottom(20)
 
-	label, _ := gtk.LabelNew("Generate New PGP Key Pair")
+	label := gtk.NewLabel("Generate New PGP Key Pair")
 	label.SetMarkup("<b>Generate New PGP Key Pair</b>")
-	box.PackStart(label, false, false, 0)
+	box.Append(label)
 
 	nameEntry := m.createLabeledEntry(box, "Name:")
 	emailEntry := m.createLabeledEntry(box, "Email:")
-	
-	passCheck, _ := gtk.CheckButtonNewWithLabel("Protect with Passphrase")
+
+	passCheck := gtk.NewCheckButtonWithLabel("Protect with Passphrase")
 	passCheck.SetActive(true)
-	box.PackStart(passCheck, false, false, 5)
+	box.Append(passCheck)
 
 	passEntry := m.createLabeledEntry(box, "Passphrase:")
 	passEntry.SetVisibility(false)
 
-	passCheck.Connect("toggled", func() {
-		isActive := passCheck.GetActive()
+	passCheck.ConnectToggled(func() {
+		isActive := passCheck.Active()
 		passEntry.SetSensitive(isActive)
-		if !isActive { passEntry.SetText("") }
+		if !isActive {
+			passEntry.SetText("")
+		}
 	})
 
-	algoBox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 5)
-	algoLabel, _ := gtk.LabelNew("Algorithm:")
-	algoCombo, _ := gtk.ComboBoxTextNew()
-	
-	// Populate algorithm choices matching constants in crypto.go
-	algoCombo.AppendText("RSA 3072 bits (Standard)") // 0
-	algoCombo.AppendText("RSA 4096 bits (High)")     // 1
-	algoCombo.AppendText("Curve25519 (Modern)")      // 2
-	algoCombo.AppendText("Curve448 (High Security)") // 3
-	algoCombo.SetActive(2) // Default to Curve25519
-	
-	algoBox.PackStart(algoLabel, false, false, 0)
-	algoBox.PackStart(algoCombo, true, true, 0)
-	box.PackStart(algoBox, false, false, 0)
+	algoBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	algoLabel := gtk.NewLabel("Algorithm:")
+	algoCombo := gtk.NewComboBoxText()
 
-	validBox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 5)
-	validLabel, _ := gtk.LabelNew("Validity:")
-	validCombo, _ := gtk.ComboBoxTextNew()
+	algoCombo.AppendText("RSA 3072 bits (Standard)")
+	algoCombo.AppendText("RSA 4096 bits (High)")
+	algoCombo.AppendText("Curve25519 (Modern)")
+	algoCombo.AppendText("Curve448 (High Security)")
+	algoCombo.SetActive(2)
+
+	algoBox.Append(algoLabel)
+	algoBox.Append(algoCombo)
+	box.Append(algoBox)
+
+	validBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	validLabel := gtk.NewLabel("Validity:")
+	validCombo := gtk.NewComboBoxText()
 	validCombo.AppendText("No Expiration")
 	validCombo.AppendText("1 Year")
 	validCombo.AppendText("2 Years")
-	validCombo.AppendText("Expired (Test: Yesterday)") // Testing option
+	validCombo.AppendText("Expired (Test: Yesterday)")
 	validCombo.SetActive(0)
-	validBox.PackStart(validLabel, false, false, 0)
-	validBox.PackStart(validCombo, true, true, 0)
-	box.PackStart(validBox, false, false, 0)
+	validBox.Append(validLabel)
+	validBox.Append(validCombo)
+	box.Append(validBox)
 
-	genBtn, _ := gtk.ButtonNewWithLabel("Generate Key Pair")
-	statusLabel, _ := gtk.LabelNew("")
+	genBtn := gtk.NewButtonWithLabel("Generate Key Pair")
 
-	genBtn.Connect("clicked", func() {
-		name, _ := nameEntry.GetText()
-		email, _ := emailEntry.GetText()
-		pass, _ := passEntry.GetText()
-		if passCheck.GetActive() && pass == "" {
-			statusLabel.SetText("Error: Passphrase required")
+	genBtn.ConnectClicked(func() {
+		name := nameEntry.Text()
+		email := emailEntry.Text()
+		pass := passEntry.Text()
+		if passCheck.Active() && pass == "" {
+			m.showDialog(gtk.MessageError, "Error: Passphrase required")
 			return
 		}
 		if name == "" || email == "" {
-			statusLabel.SetText("Error: Name and Email required")
+			m.showDialog(gtk.MessageError, "Error: Name and Email required")
 			return
 		}
 
-		algoIndex := algoCombo.GetActive()
+		algoIndex := algoCombo.Active()
 
 		lifetime := 0
-		switch validCombo.GetActive() {
-		case 1: lifetime = 31536000
-		case 2: lifetime = 31536000 * 2
-		case 3: lifetime = -1 // Flag to trigger expired key logic
+		switch validCombo.Active() {
+		case 1:
+			lifetime = 31536000
+		case 2:
+			lifetime = 31536000 * 2
+		case 3:
+			lifetime = -1
 		}
 
-		statusLabel.SetText("Generating...")
 		genBtn.SetSensitive(false)
 
 		go func() {
 			err := m.generateKey(name, email, pass, algoIndex, lifetime)
-			glib.IdleAdd(func() bool {
+			glib.IdleAdd(func() {
 				genBtn.SetSensitive(true)
 				if err != nil {
-					statusLabel.SetText("Error: " + err.Error())
+					m.showDialog(gtk.MessageError, "Error: "+err.Error())
 				} else {
-					statusLabel.SetText("Success!")
-					nameEntry.SetText(""); emailEntry.SetText(""); passEntry.SetText("")
-					m.loadKeyring()
+					m.showDialog(gtk.MessageInfo, "Key Pair Generated Successfully!")
+					nameEntry.SetText("")
+					emailEntry.SetText("")
+					passEntry.SetText("")
+					go m.loadKeyring()
 				}
-				return false
 			})
 		}()
 	})
 
-	box.PackStart(genBtn, false, false, 10)
-	box.PackStart(statusLabel, false, false, 0)
-	
-	lbl, _ := gtk.LabelNew("Key Gen")
+	box.Append(genBtn)
+
+	lbl := gtk.NewLabel("Key Gen")
 	m.notebook.AppendPage(box, lbl)
 }
 
@@ -119,195 +138,195 @@ func (m *PGPManager) createKeyGenTab() {
 // TAB 2: KEY LIST
 // ---------------------------------------------------------
 
-// createKeyListTab builds the UI for displaying and managing the keyring.
 func (m *PGPManager) createKeyListTab() {
-	box, _ := gtk.BoxNew(gtk.ORIENTATION_VERTICAL, 10)
-	box.SetMarginStart(20); box.SetMarginEnd(20); box.SetMarginTop(20); box.SetMarginBottom(20)
+	box := gtk.NewBox(gtk.OrientationVertical, 10)
+	box.SetMarginStart(20)
+	box.SetMarginEnd(20)
+	box.SetMarginTop(20)
+	box.SetMarginBottom(20)
 
-	label, _ := gtk.LabelNew("Key Management")
+	label := gtk.NewLabel("Key Management")
 	label.SetMarkup("<b>Keyring Contents</b>")
-	label.SetHAlign(gtk.ALIGN_START) 
-	box.PackStart(label, false, false, 0)
+	label.SetHAlign(gtk.AlignStart)
+	box.Append(label)
 
-	scrolled, _ := gtk.ScrolledWindowNew(nil, nil)
-	scrolled.SetPolicy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
-	m.keyList, _ = gtk.ListBoxNew()
-	m.keyList.SetSelectionMode(gtk.SELECTION_SINGLE)
-	scrolled.Add(m.keyList)
-	box.PackStart(scrolled, true, true, 10)
+	scrolled := gtk.NewScrolledWindow()
+	scrolled.SetPolicy(gtk.PolicyAutomatic, gtk.PolicyAutomatic)
+	scrolled.SetVExpand(true)
 
-	actionFrame, _ := gtk.FrameNew("Actions")
-	actionBox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 10)
-	actionBox.SetMarginStart(10); actionBox.SetMarginEnd(10); actionBox.SetMarginTop(10); actionBox.SetMarginBottom(10)
-	actionFrame.Add(actionBox)
+	m.keyList = gtk.NewListBox()
+	m.keyList.SetSelectionMode(gtk.SelectionSingle)
+	scrolled.SetChild(m.keyList)
+	box.Append(scrolled)
 
-	exportPubBtn, _ := gtk.ButtonNewWithLabel("Export Public")
-	exportPrivBtn, _ := gtk.ButtonNewWithLabel("Export Private")
-	deleteBtn, _ := gtk.ButtonNewWithLabel("Delete")
-	importBtn, _ := gtk.ButtonNewWithLabel("Import")
+	actionFrame := gtk.NewFrame("Actions")
+	actionBox := gtk.NewBox(gtk.OrientationHorizontal, 10)
+	actionBox.SetMarginStart(10)
+	actionBox.SetMarginEnd(10)
+	actionBox.SetMarginTop(10)
+	actionBox.SetMarginBottom(10)
+	actionFrame.SetChild(actionBox)
+
+	exportPubBtn := gtk.NewButtonWithLabel("Export Public")
+	exportPrivBtn := gtk.NewButtonWithLabel("Export Private")
+	deleteBtn := gtk.NewButtonWithLabel("Delete")
+	importBtn := gtk.NewButtonWithLabel("Import")
 
 	getSelectedKeyID := func() string {
-		row := m.keyList.GetSelectedRow()
-		if row == nil { return "" }
-		id, _ := row.GetName()
-		return id
+		row := m.keyList.SelectedRow()
+		if row == nil {
+			return ""
+		}
+		return row.Name()
 	}
 
-	exportPubBtn.Connect("clicked", func() {
+	exportPubBtn.ConnectClicked(func() {
 		id := getSelectedKeyID()
-		if id == "" { return }
-		dialog, _ := gtk.FileChooserNativeDialogNew("Export Public", m.window, gtk.FILE_CHOOSER_ACTION_SAVE, "Export", "Cancel")
-		dialog.SetCurrentName(id + "_public.asc")
-		if dialog.Run() == int(gtk.RESPONSE_ACCEPT) {
-			m.exportKey(id, false, dialog.GetFilename(), "")
+		if id == "" {
+			return
 		}
-		dialog.Destroy()
+		dialog := gtk.NewFileChooserNative("Export Public", m.window, gtk.FileChooserActionSave, "Export", "Cancel")
+		dialog.SetCurrentName(id + "_public.asc")
+
+		dialog.ConnectResponse(func(responseId int) {
+			if responseId == int(gtk.ResponseAccept) {
+				gfile := dialog.File()
+				if err := m.exportKey(id, false, gfile.Path(), ""); err != nil {
+					m.showDialog(gtk.MessageError, "Export Failed: "+err.Error())
+				} else {
+					m.showDialog(gtk.MessageInfo, "Public Key Exported Successfully!")
+				}
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
 	})
 
-	exportPrivBtn.Connect("clicked", func() {
+	exportPrivBtn.ConnectClicked(func() {
 		id := getSelectedKeyID()
-		if id == "" { return }
+		if id == "" {
+			return
+		}
 
 		isPrivate, isLocked, err := m.GetKeyStatus(id)
 		if err != nil {
-			dlg := gtk.MessageDialogNew(m.window, 0, gtk.MESSAGE_ERROR, gtk.BUTTONS_OK, "Error reading key: %v", err)
-			dlg.Run(); dlg.Destroy()
+			m.showDialog(gtk.MessageError, "Error reading key: "+err.Error())
 			return
 		}
 
 		if !isPrivate {
-			dlg := gtk.MessageDialogNew(m.window, 0, gtk.MESSAGE_WARNING, gtk.BUTTONS_OK, "Cannot Export: This is a Public Key only.")
-			dlg.Run(); dlg.Destroy()
+			m.showDialog(gtk.MessageWarning, "Cannot Export: This is a Public Key only.")
 			return
 		}
 
-		passphrase := ""
-		
 		if isLocked {
-			// Prompt for passphrase if key is locked
-			pwdDialog, err := gtk.DialogNewWithButtons("Unlock Key", m.window, gtk.DIALOG_MODAL,
-				[]interface{}{"Cancel", gtk.RESPONSE_CANCEL, "Unlock", gtk.RESPONSE_ACCEPT})
-			
-			if err != nil {
-				return
-			}
-			
-			contentArea, _ := pwdDialog.GetContentArea()
-			contentArea.SetSpacing(10)
-			
-			lbl, _ := gtk.LabelNew("Enter passphrase to authorize export:")
-			pwdEntry, _ := gtk.EntryNew()
-			pwdEntry.SetVisibility(false)
-			
-			pwdEntry.Connect("activate", func() {
-				pwdDialog.Response(gtk.RESPONSE_ACCEPT)
-			})
-			
-			contentArea.Add(lbl)
-			contentArea.Add(pwdEntry)
-			
-			pwdDialog.SetDefaultResponse(gtk.RESPONSE_ACCEPT)
-			contentArea.ShowAll()
-			pwdEntry.GrabFocus() 
-
-			resp := pwdDialog.Run()
-			passphrase, _ = pwdEntry.GetText()
-			pwdDialog.Destroy()
-
-			if resp != gtk.RESPONSE_ACCEPT {
-				return
-			}
+			m.showDialog(gtk.MessageWarning, "Exporting locked keys requires unlocked keyring (Not implemented in this port).")
+			return
 		}
 
-		dialog, _ := gtk.FileChooserNativeDialogNew("Export Private", m.window, gtk.FILE_CHOOSER_ACTION_SAVE, "Export", "Cancel")
+		dialog := gtk.NewFileChooserNative("Export Private", m.window, gtk.FileChooserActionSave, "Export", "Cancel")
 		dialog.SetCurrentName(id + "_private.asc")
-		
-		if dialog.Run() == int(gtk.RESPONSE_ACCEPT) {
-			err := m.exportKey(id, true, dialog.GetFilename(), passphrase)
-			if err != nil {
-				errMsg := gtk.MessageDialogNew(m.window, 0, gtk.MESSAGE_ERROR, gtk.BUTTONS_OK, "Export Failed: %v", err)
-				errMsg.Run(); errMsg.Destroy()
+
+		dialog.ConnectResponse(func(responseId int) {
+			if responseId == int(gtk.ResponseAccept) {
+				gfile := dialog.File()
+				err := m.exportKey(id, true, gfile.Path(), "")
+				if err != nil {
+					m.showDialog(gtk.MessageError, "Export Failed: "+err.Error())
+				} else {
+					m.showDialog(gtk.MessageInfo, "Private Key Exported Successfully!")
+				}
 			}
-		}
-		dialog.Destroy()
+			dialog.Destroy()
+		})
+		dialog.Show()
 	})
 
-	deleteBtn.Connect("clicked", func() {
+	deleteBtn.ConnectClicked(func() {
 		id := getSelectedKeyID()
-		if id == "" { return }
-		dialog := gtk.MessageDialogNew(m.window, 0, gtk.MESSAGE_QUESTION, gtk.BUTTONS_YES_NO, "Delete %s?", id)
-		if dialog.Run() == gtk.RESPONSE_YES { m.deleteKey(id) }
-		dialog.Destroy()
+		if id == "" {
+			return
+		}
+
+		dialog := gtk.NewMessageDialog(m.window, gtk.DialogModal, gtk.MessageQuestion, gtk.ButtonsYesNo)
+		dialog.SetMarkup(fmt.Sprintf("Delete %s?", id))
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseYes) {
+				m.deleteKey(id)
+				m.showDialog(gtk.MessageInfo, "Key Deleted Successfully")
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
 	})
 
-	importBtn.Connect("clicked", func() {
-		dialog, _ := gtk.FileChooserNativeDialogNew("Select Key", m.window, gtk.FILE_CHOOSER_ACTION_OPEN, "Open", "Cancel")
-		if dialog.Run() == int(gtk.RESPONSE_ACCEPT) { m.importKey(dialog.GetFilename()) }
-		dialog.Destroy()
+	importBtn.ConnectClicked(func() {
+		dialog := gtk.NewFileChooserNative("Select Key", m.window, gtk.FileChooserActionOpen, "Open", "Cancel")
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseAccept) {
+				gfile := dialog.File()
+				if err := m.importKey(gfile.Path()); err != nil {
+					m.showDialog(gtk.MessageError, "Import Failed: "+err.Error())
+				} else {
+					m.showDialog(gtk.MessageInfo, "Key Imported Successfully!")
+				}
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
 	})
 
-	actionBox.PackStart(exportPubBtn, false, false, 0)
-	actionBox.PackStart(exportPrivBtn, false, false, 0)
-	actionBox.PackStart(deleteBtn, false, false, 0)
-	actionBox.PackEnd(importBtn, false, false, 0)
+	actionBox.Append(exportPubBtn)
+	actionBox.Append(exportPrivBtn)
+	actionBox.Append(deleteBtn)
+	actionBox.Append(importBtn)
 
-	box.PackStart(actionFrame, false, false, 0)
+	box.Append(actionFrame)
 	m.refreshKeyList()
-	
-	lbl, _ := gtk.LabelNew("Key List")
+
+	lbl := gtk.NewLabel("Key List")
 	m.notebook.AppendPage(box, lbl)
 }
 
-// refreshKeyList rebuilds the key list view, calculating expiry dates and
-// highlighting expired keys.
 func (m *PGPManager) refreshKeyList() {
-	glib.IdleAdd(func() bool {
-		if m.keyList == nil { return false }
-		children := m.keyList.GetChildren()
-		children.Foreach(func(item interface{}) { m.keyList.Remove(item.(gtk.IWidget)) })
+	glib.IdleAdd(func() {
+		if m.keyList == nil {
+			return
+		}
 
-		if m.keyring == nil { return false }
-		
+		// Remove all children safely
+		for {
+			child := m.keyList.FirstChild()
+			if child == nil {
+				break
+			}
+			m.keyList.Remove(child)
+		}
+
+		if m.keyring == nil {
+			return
+		}
+
 		for _, key := range m.keyring.GetKeys() {
 			name := "Unknown"
 			email := "Unknown"
-			dateInfo := "Created: Unknown -> Expires: Never"
-			
+			dateInfo := "Created: Unknown -> Never"
+
 			if entity := key.GetEntity(); entity != nil {
-				// Attempt to get identity info using current time
-				sig, ident := entity.PrimaryIdentity(time.Now(), nil)
-				
-				// Fallback: If identity lookup fails (e.g., key expired), use creation time
-				if sig == nil {
-					sig, ident = entity.PrimaryIdentity(entity.PrimaryKey.CreationTime, nil)
-				}
-				
+				_, ident := entity.PrimaryIdentity(time.Now(), nil)
 				if ident != nil {
 					if ident.UserId != nil {
 						name = ident.UserId.Name
 						email = ident.UserId.Email
 					}
 				}
-				
-				// Calculate and format dates
-				creation := entity.PrimaryKey.CreationTime
-				createdStr := creation.Format("2006-01-02")
-				expiresStr := "Never"
 
-				if sig != nil && sig.KeyLifetimeSecs != nil {
-					life := *sig.KeyLifetimeSecs
-					if life != 0 {
-						exp := creation.Add(time.Duration(life) * time.Second)
-						expiresStr = exp.Format("2006-01-02")
-					}
-				}
-				
-				dateInfo = fmt.Sprintf("Created: %s -> Expires: %s", createdStr, expiresStr)
+				creation := entity.PrimaryKey.CreationTime
+				createdStr := creation.Format("02 Jan 2006")
+				dateInfo = fmt.Sprintf("Created: %s", createdStr)
 			}
-			
+
 			keyID := key.GetHexKeyID()
-			
-			// Highlight expired keys in red
 			isExpired := key.IsExpired(time.Now().Unix())
 			color := "black"
 			status := "Valid"
@@ -316,28 +335,28 @@ func (m *PGPManager) refreshKeyList() {
 				status = "[EXPIRED]"
 			}
 
-			row, _ := gtk.ListBoxRowNew()
+			row := gtk.NewListBoxRow()
 			row.SetName(keyID)
 
-			hbox, _ := gtk.BoxNew(gtk.ORIENTATION_VERTICAL, 2)
-			hbox.SetMarginStart(10); hbox.SetMarginTop(5); hbox.SetMarginBottom(5)
-			
+			hbox := gtk.NewBox(gtk.OrientationVertical, 2)
+			hbox.SetMarginStart(10)
+			hbox.SetMarginTop(5)
+			hbox.SetMarginBottom(5)
+
 			displayText := fmt.Sprintf(
 				"<span color='%s'><b>%s</b> <small>&lt;%s&gt;</small>\n"+
-				"<small>ID: %s  |  %s  |  %s</small></span>",
+					"<small>ID: %s  |  %s  |  %s</small></span>",
 				color, name, email, keyID, dateInfo, status,
 			)
-			
-			lbl, _ := gtk.LabelNew(displayText)
-			lbl.SetUseMarkup(true)
-			lbl.SetXAlign(0)
 
-			hbox.PackStart(lbl, false, false, 0)
-			row.Add(hbox)
-			m.keyList.Add(row)
+			lbl := gtk.NewLabel(displayText)
+			lbl.SetUseMarkup(true)
+			lbl.SetHAlign(gtk.AlignStart)
+
+			hbox.Append(lbl)
+			row.SetChild(hbox)
+			m.keyList.Append(row)
 		}
-		m.keyList.ShowAll()
-		return false
 	})
 }
 
@@ -345,55 +364,87 @@ func (m *PGPManager) refreshKeyList() {
 // TAB 3: ENCRYPTION
 // ---------------------------------------------------------
 
-// createEncryptTab builds the UI for file encryption.
 func (m *PGPManager) createEncryptTab() {
-	box, _ := gtk.BoxNew(gtk.ORIENTATION_VERTICAL, 10)
-	box.SetMarginStart(20); box.SetMarginEnd(20); box.SetMarginTop(20); box.SetMarginBottom(20)
-	
-	label, _ := gtk.LabelNew("Encrypt File")
+	box := gtk.NewBox(gtk.OrientationVertical, 10)
+	box.SetMarginStart(20)
+	box.SetMarginEnd(20)
+	box.SetMarginTop(20)
+	box.SetMarginBottom(20)
+
+	label := gtk.NewLabel("Encrypt File")
 	label.SetMarkup("<b>Encrypt File</b>")
-	box.PackStart(label, false, false, 0)
+	box.Append(label)
 
 	fileEntry := m.createLabeledEntry(box, "Input File:")
-	
-	symCheck, _ := gtk.CheckButtonNewWithLabel("Password Only (Symmetric)")
-	box.PackStart(symCheck, false, false, 5)
+
+	symCheck := gtk.NewCheckButtonWithLabel("Password Only (Symmetric)")
+	box.Append(symCheck)
 
 	recipientCombo := m.createLabeledCombo(box, "Recipient:")
 	passwordEntry := m.createLabeledEntry(box, "Password:")
+
+	// Store parent boxes for visibility toggling
+	var pParentBox *gtk.Box
+	var rParentBox *gtk.Box
 	
-	pWidget, _ := passwordEntry.GetParent(); pParent, _ := pWidget.(*gtk.Box); pParent.SetVisible(false)
+	if w := passwordEntry.Parent(); w != nil {
+		if box, ok := w.(*gtk.Box); ok {
+			pParentBox = box
+			pParentBox.SetVisible(false)
+		}
+	}
+	
+	if w := recipientCombo.Parent(); w != nil {
+		if box, ok := w.(*gtk.Box); ok {
+			rParentBox = box
+		}
+	}
 
-	symCheck.Connect("toggled", func() {
-		isSymmetric := symCheck.GetActive()
-		rWidget, _ := recipientCombo.GetParent(); rParent, _ := rWidget.(*gtk.Box); rParent.SetVisible(!isSymmetric)
-		pParent.SetVisible(isSymmetric)
-	})
-
-	browseBtn, _ := gtk.ButtonNewWithLabel("Browse...")
-	browseBtn.Connect("clicked", func() {
-		dialog, _ := gtk.FileChooserNativeDialogNew("Select File", m.window, gtk.FILE_CHOOSER_ACTION_OPEN, "Open", "Cancel")
-		if dialog.Run() == int(gtk.RESPONSE_ACCEPT) { fileEntry.SetText(dialog.GetFilename()) }
-		dialog.Destroy()
-	})
-	box.PackStart(browseBtn, false, false, 0)
-
-	encryptBtn, _ := gtk.ButtonNewWithLabel("Encrypt")
-	statusLabel, _ := gtk.LabelNew("")
-	encryptBtn.Connect("clicked", func() {
-		file, _ := fileEntry.GetText()
-		if symCheck.GetActive() {
-			pass, _ := passwordEntry.GetText()
-			if err := m.EncryptFileSymmetric(file, pass); err != nil { statusLabel.SetText("Error: "+err.Error()) } else { statusLabel.SetText("Success!") }
-		} else {
-			rcpt := recipientCombo.GetActiveText()
-			if err := m.encryptFile(file, rcpt); err != nil { statusLabel.SetText("Error: "+err.Error()) } else { statusLabel.SetText("Success!") }
+	symCheck.ConnectToggled(func() {
+		isSymmetric := symCheck.Active()
+		if rParentBox != nil {
+			rParentBox.SetVisible(!isSymmetric)
+		}
+		if pParentBox != nil {
+			pParentBox.SetVisible(isSymmetric)
 		}
 	})
-	box.PackStart(encryptBtn, false, false, 0)
-	box.PackStart(statusLabel, false, false, 0)
-	
-	lbl, _ := gtk.LabelNew("Encrypt")
+
+	browseBtn := gtk.NewButtonWithLabel("Browse...")
+	browseBtn.ConnectClicked(func() {
+		dialog := gtk.NewFileChooserNative("Select File", m.window, gtk.FileChooserActionOpen, "Open", "Cancel")
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseAccept) {
+				fileEntry.SetText(dialog.File().Path())
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
+	})
+	box.Append(browseBtn)
+
+	encryptBtn := gtk.NewButtonWithLabel("Encrypt")
+	encryptBtn.ConnectClicked(func() {
+		file := fileEntry.Text()
+		var err error
+
+		if symCheck.Active() {
+			pass := passwordEntry.Text()
+			err = m.EncryptFileSymmetric(file, pass)
+		} else {
+			rcpt := recipientCombo.ActiveText()
+			err = m.encryptFile(file, rcpt)
+		}
+
+		if err != nil {
+			m.showDialog(gtk.MessageError, "Error: "+err.Error())
+		} else {
+			m.showDialog(gtk.MessageInfo, "File Encrypted Successfully!")
+		}
+	})
+	box.Append(encryptBtn)
+
+	lbl := gtk.NewLabel("Encrypt")
 	m.notebook.AppendPage(box, lbl)
 }
 
@@ -401,86 +452,223 @@ func (m *PGPManager) createEncryptTab() {
 // TAB 4: DECRYPTION
 // ---------------------------------------------------------
 
-// createDecryptTab builds the UI for file decryption.
 func (m *PGPManager) createDecryptTab() {
-	box, _ := gtk.BoxNew(gtk.ORIENTATION_VERTICAL, 10)
-	box.SetMarginStart(20); box.SetMarginEnd(20); box.SetMarginTop(20); box.SetMarginBottom(20)
-	
-	label, _ := gtk.LabelNew("Decrypt File")
+	box := gtk.NewBox(gtk.OrientationVertical, 10)
+	box.SetMarginStart(20)
+	box.SetMarginEnd(20)
+	box.SetMarginTop(20)
+	box.SetMarginBottom(20)
+
+	label := gtk.NewLabel("Decrypt File")
 	label.SetMarkup("<b>Decrypt File</b>")
-	box.PackStart(label, false, false, 0)
+	box.Append(label)
 
 	fileEntry := m.createLabeledEntry(box, "Encrypted File:")
-	symCheck, _ := gtk.CheckButtonNewWithLabel("Symmetric (Password Only)")
-	box.PackStart(symCheck, false, false, 5)
+	symCheck := gtk.NewCheckButtonWithLabel("Symmetric (Password Only)")
+	box.Append(symCheck)
 
 	keyCombo := m.createLabeledCombo(box, "My Key:")
-	passCheck, _ := gtk.CheckButtonNewWithLabel("Key requires Passphrase")
+	passCheck := gtk.NewCheckButtonWithLabel("Key requires Passphrase")
 	passCheck.SetActive(true)
-	box.PackStart(passCheck, false, false, 0)
-	
+	box.Append(passCheck)
+
 	passEntry := m.createLabeledEntry(box, "Passphrase / Password:")
 	passEntry.SetVisibility(false)
 
-	symCheck.Connect("toggled", func() {
-		isSym := symCheck.GetActive()
-		kWidget, _ := keyCombo.GetParent(); kParent, _ := kWidget.(*gtk.Box); kParent.SetVisible(!isSym)
+	var kParentBox *gtk.Box
+	if w := keyCombo.Parent(); w != nil {
+		if box, ok := w.(*gtk.Box); ok {
+			kParentBox = box
+		}
+	}
+
+	symCheck.ConnectToggled(func() {
+		isSym := symCheck.Active()
+		if kParentBox != nil {
+			kParentBox.SetVisible(!isSym)
+		}
 		passCheck.SetVisible(!isSym)
 	})
-	
-	passCheck.Connect("toggled", func() {
-		if !symCheck.GetActive() {
-			passEntry.SetSensitive(passCheck.GetActive())
+
+	passCheck.ConnectToggled(func() {
+		if !symCheck.Active() {
+			passEntry.SetSensitive(passCheck.Active())
 		}
 	})
 
-	browseBtn, _ := gtk.ButtonNewWithLabel("Browse...")
-	browseBtn.Connect("clicked", func() {
-		dialog, _ := gtk.FileChooserNativeDialogNew("Select Encrypted", m.window, gtk.FILE_CHOOSER_ACTION_OPEN, "Open", "Cancel")
-		if dialog.Run() == int(gtk.RESPONSE_ACCEPT) { fileEntry.SetText(dialog.GetFilename()) }
-		dialog.Destroy()
+	browseBtn := gtk.NewButtonWithLabel("Browse...")
+	browseBtn.ConnectClicked(func() {
+		dialog := gtk.NewFileChooserNative("Select Encrypted", m.window, gtk.FileChooserActionOpen, "Open", "Cancel")
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseAccept) {
+				fileEntry.SetText(dialog.File().Path())
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
 	})
-	box.PackStart(browseBtn, false, false, 0)
+	box.Append(browseBtn)
 
-	decryptBtn, _ := gtk.ButtonNewWithLabel("Decrypt")
-	statusLabel, _ := gtk.LabelNew("")
-	decryptBtn.Connect("clicked", func() {
-		file, _ := fileEntry.GetText()
-		pass, _ := passEntry.GetText()
+	decryptBtn := gtk.NewButtonWithLabel("Decrypt")
+	decryptBtn.ConnectClicked(func() {
+		file := fileEntry.Text()
+		pass := passEntry.Text()
 		selector := ""
-		if !symCheck.GetActive() { selector = keyCombo.GetActiveText() }
-		if err := m.decryptFile(file, pass, selector); err != nil { statusLabel.SetText("Error: "+err.Error()) } else { statusLabel.SetText("Success!") }
+		if !symCheck.Active() {
+			selector = keyCombo.ActiveText()
+		}
+
+		err := m.decryptFile(file, pass, selector)
+		if err != nil {
+			m.showDialog(gtk.MessageError, "Error: "+err.Error())
+		} else {
+			m.showDialog(gtk.MessageInfo, "File Decrypted Successfully!")
+		}
 	})
-	box.PackStart(decryptBtn, false, false, 0)
-	box.PackStart(statusLabel, false, false, 0)
-	
-	lbl, _ := gtk.LabelNew("Decrypt")
+	box.Append(decryptBtn)
+
+	lbl := gtk.NewLabel("Decrypt")
 	m.notebook.AppendPage(box, lbl)
 }
 
-// createEmailTab: Placeholder
-func (m *PGPManager) createEmailTab() {}
-// createInboxTab: Placeholder
-func (m *PGPManager) createInboxTab() {}
+// ---------------------------------------------------------
+// TAB 5: SEND ENCRYPTED EMAIL
+// ---------------------------------------------------------
+
+func (m *PGPManager) createSendTab() {
+	box := gtk.NewBox(gtk.OrientationVertical, 10)
+	box.SetMarginStart(20)
+	box.SetMarginEnd(20)
+	box.SetMarginTop(20)
+	box.SetMarginBottom(20)
+
+	label := gtk.NewLabel("Send Encrypted Email")
+	label.SetMarkup("<b>Send Encrypted Email</b>")
+	box.Append(label)
+
+	authBtn := gtk.NewButtonWithLabel("Login to Gmail")
+
+	// Message Composition Form
+	formBox := gtk.NewBox(gtk.OrientationVertical, 5)
+
+	recipientCombo := m.createLabeledCombo(formBox, "To (Select Key):")
+	subjectEntry := m.createLabeledEntry(formBox, "Subject:")
+
+	// Body Text Area
+	bodyLabel := gtk.NewLabel("Message Body:")
+	bodyLabel.SetHAlign(gtk.AlignStart)
+	formBox.Append(bodyLabel)
+
+	scrolled := gtk.NewScrolledWindow()
+	scrolled.SetPolicy(gtk.PolicyAutomatic, gtk.PolicyAutomatic)
+	scrolled.SetMinContentHeight(200)
+	scrolled.SetVExpand(true)
+
+	bodyView := gtk.NewTextView()
+	bodyView.SetWrapMode(gtk.WrapWord)
+	scrolled.SetChild(bodyView)
+	formBox.Append(scrolled)
+
+	box.Append(formBox)
+
+	sendBtn := gtk.NewButtonWithLabel("Encrypt & Send")
+	sendBtn.SetSensitive(false)
+
+	// Auth Logic (Silent + Manual)
+	checkAuth := func() {
+		if m.AttemptSilentAuth() {
+			glib.IdleAdd(func() {
+				authBtn.SetVisible(false)
+				sendBtn.SetSensitive(true)
+			})
+		}
+	}
+
+	authBtn.ConnectClicked(func() {
+		go func() {
+			err := m.authenticateGmail()
+			glib.IdleAdd(func() {
+				if err != nil {
+					m.showDialog(gtk.MessageError, "Auth Error: "+err.Error())
+				} else {
+					m.showDialog(gtk.MessageInfo, "Authentication Successful!")
+					authBtn.SetVisible(false)
+					sendBtn.SetSensitive(true)
+				}
+			})
+		}()
+	})
+	box.Append(authBtn)
+
+	sendBtn.ConnectClicked(func() {
+		// Get Data
+		rcptKey := recipientCombo.ActiveText()
+		subject := subjectEntry.Text()
+
+		buffer := bodyView.Buffer()
+		start := buffer.StartIter()
+		end := buffer.EndIter()
+		body := buffer.Text(start, end, false)
+
+		if rcptKey == "" {
+			m.showDialog(gtk.MessageError, "Please select a recipient key.")
+			return
+		}
+
+		sendBtn.SetSensitive(false)
+
+		go func() {
+			// Encrypt is ALWAYS true for this tab
+			err := m.sendEmail(rcptKey, subject, body, true)
+			glib.IdleAdd(func() {
+				sendBtn.SetSensitive(true)
+				if err != nil {
+					m.showDialog(gtk.MessageError, "Send Failed: "+err.Error())
+				} else {
+					m.showDialog(gtk.MessageInfo, "Encrypted Email Sent Successfully!")
+					// Clear body
+					buffer.SetText("")
+					subjectEntry.SetText("")
+				}
+			})
+		}()
+	})
+	box.Append(sendBtn)
+
+	lbl := gtk.NewLabel("Send Email")
+	m.notebook.AppendPage(box, lbl)
+
+	// Try auth on startup
+	go checkAuth()
+}
 
 // Helpers
 func (m *PGPManager) createLabeledEntry(box *gtk.Box, labelText string) *gtk.Entry {
-	hbox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 5)
-	label, _ := gtk.LabelNew(labelText)
-	label.SetWidthChars(15); label.SetXAlign(0)
-	entry, _ := gtk.EntryNew()
-	hbox.PackStart(label, false, false, 0); hbox.PackStart(entry, true, true, 0)
-	box.PackStart(hbox, false, false, 0)
+	hbox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	label := gtk.NewLabel(labelText)
+	label.SetSizeRequest(100, -1)
+	label.SetHAlign(gtk.AlignStart)
+	entry := gtk.NewEntry()
+	entry.SetHExpand(true)
+
+	hbox.Append(label)
+	hbox.Append(entry)
+	box.Append(hbox)
 	return entry
 }
 
 func (m *PGPManager) createLabeledCombo(box *gtk.Box, labelText string) *gtk.ComboBoxText {
-	hbox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 5)
-	label, _ := gtk.LabelNew(labelText)
-	label.SetWidthChars(15); label.SetXAlign(0)
-	combo, _ := gtk.ComboBoxTextNew()
-	hbox.PackStart(label, false, false, 0); hbox.PackStart(combo, true, true, 0)
-	box.PackStart(hbox, false, false, 0)
+	hbox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	label := gtk.NewLabel(labelText)
+	label.SetSizeRequest(100, -1)
+	label.SetHAlign(gtk.AlignStart)
+	combo := gtk.NewComboBoxText()
+	combo.SetHExpand(true)
+
+	hbox.Append(label)
+	hbox.Append(combo)
+	box.Append(hbox)
+
 	m.keyCombos = append(m.keyCombos, combo)
 	m.refreshCombo(combo)
 	return combo
@@ -488,11 +676,12 @@ func (m *PGPManager) createLabeledCombo(box *gtk.Box, labelText string) *gtk.Com
 
 func (m *PGPManager) refreshCombo(c *gtk.ComboBoxText) {
 	c.RemoveAll()
-	if m.keyring == nil { return }
+	if m.keyring == nil {
+		return
+	}
 	for _, key := range m.keyring.GetKeys() {
 		email := "unknown"
 		if key.GetEntity() != nil {
-			// FIXED: Capture 2 values
 			_, ident := key.GetEntity().PrimaryIdentity(time.Now(), nil)
 			if ident != nil && ident.UserId != nil {
 				email = ident.UserId.Email
@@ -500,12 +689,15 @@ func (m *PGPManager) refreshCombo(c *gtk.ComboBoxText) {
 		}
 		c.AppendText(fmt.Sprintf("%s [%s]", email, key.GetHexKeyID()))
 	}
-	if m.keyring.CountEntities() > 0 { c.SetActive(0) }
+	if m.keyring.CountEntities() > 0 {
+		c.SetActive(0)
+	}
 }
 
 func (m *PGPManager) refreshCombos() {
-	glib.IdleAdd(func() bool {
-		for _, c := range m.keyCombos { m.refreshCombo(c) }
-		return false
+	glib.IdleAdd(func() {
+		for _, c := range m.keyCombos {
+			m.refreshCombo(c)
+		}
 	})
 }
