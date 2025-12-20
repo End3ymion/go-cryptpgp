@@ -89,7 +89,10 @@ func (m *PGPManager) GetKeyStatus(id string) (isPrivate bool, isLocked bool, err
 	}
 
 	isPrivate = key.IsPrivate()
-	isLocked, _ = key.IsLocked()
+	// Only check IsLocked if it is private to avoid "public key cannot be lock" error
+	if isPrivate {
+		isLocked, _ = key.IsLocked()
+	}
 	return isPrivate, isLocked, nil
 }
 
@@ -198,7 +201,12 @@ func (m *PGPManager) deleteKey(targetKeyID string) error {
 	newKeyring, _ := crypto.NewKeyRing(nil)
 	for _, key := range m.keyring.GetKeys() {
 		if key.GetHexKeyID() != targetKeyID {
-			newKeyring.AddKey(key)
+			// Try to add key to new keyring
+			if err := newKeyring.AddKey(key); err != nil {
+				// If adding fails (e.g., locked private key), add public part
+				pub, _ := key.ToPublic()
+				newKeyring.AddKey(pub)
+			}
 		}
 	}
 	m.keyring = newKeyring
@@ -216,45 +224,109 @@ func (m *PGPManager) deleteKey(targetKeyID string) error {
 	return nil
 }
 
-// encryptFile encrypts a file for a specific recipient using their public key.
-func (m *PGPManager) encryptFile(inputFile, recipientSelector string) error {
-	targetID := ""
-	if idx := strings.LastIndex(recipientSelector, "["); idx != -1 {
-		if endIdx := strings.LastIndex(recipientSelector, "]"); endIdx != -1 && endIdx > idx {
-			targetID = recipientSelector[idx+1 : endIdx]
-		}
-	}
+// encryptFile encrypts a file for a specific recipient using Key ID.
+// Optionally signs it if signKeyID is provided.
+func (m *PGPManager) encryptFile(inputFile, recipientKeyID, signKeyID, signPassphrase, outputDir string) error {
+	// Determine mode: If no recipient is selected, we are in "Sign Only" mode.
+	isSignOnly := (recipientKeyID == "")
 
+	// 1. Find Recipient Key (Only if we are encrypting)
 	var foundKey *crypto.Key
-	for _, key := range m.keyring.GetKeys() {
-		if key.GetHexKeyID() == targetID {
-			foundKey = key
-			break
+	if !isSignOnly {
+		for _, key := range m.keyring.GetKeys() {
+			if key.GetHexKeyID() == recipientKeyID {
+				foundKey = key
+				break
+			}
+		}
+		if foundKey == nil {
+			return fmt.Errorf("recipient key not found")
 		}
 	}
-	if foundKey == nil {
-		return fmt.Errorf("recipient key not found")
+
+	// 2. Prepare Signing Key (Common for both modes if signing is requested)
+	var signKey *crypto.Key
+	if signKeyID != "" {
+		keyPath, err := findKeyFile(signKeyID)
+		if err != nil { return fmt.Errorf("signing key file not found: %v", err) }
+		
+		keyData, err := os.ReadFile(keyPath)
+		if err != nil { return err }
+
+		signKey, err = crypto.NewKeyFromArmored(string(keyData))
+		if err != nil {
+			signKey, err = crypto.NewKey(keyData)
+			if err != nil { return fmt.Errorf("bad signing key format: %v", err) }
+		}
+
+		if !signKey.IsPrivate() {
+			return fmt.Errorf("selected signing key does not contain a private key")
+		}
+
+		isLocked, _ := signKey.IsLocked()
+		if isLocked {
+			if signPassphrase == "" {
+				return fmt.Errorf("signing key is locked; passphrase required")
+			}
+			signKey, err = signKey.Unlock([]byte(signPassphrase))
+			if err != nil {
+				return fmt.Errorf("signing key unlock failed: %v", err)
+			}
+		}
 	}
 
-	encryptionHandle, err := m.pgp.Encryption().
-		Recipient(foundKey).
-		New()
-	if err != nil { return err }
+	// Validation: Must do at least one thing
+	if isSignOnly && signKey == nil {
+		return fmt.Errorf("operation must either have a recipient (encrypt) or a signing key (sign)")
+	}
 
+	// 3. Perform Operation
 	data, err := os.ReadFile(inputFile)
 	if err != nil { return err }
 
-	pgpMessage, err := encryptionHandle.Encrypt(data)
-	if err != nil { return err }
+	// Determine output path
+	targetDir := filepath.Dir(inputFile)
+	if outputDir != "" {
+		targetDir = outputDir
+	}
+	baseName := filepath.Base(inputFile)
 
-	armored, err := pgpMessage.Armor()
-	if err != nil { return err }
-	
-	return os.WriteFile(inputFile+".pgp", []byte(armored), 0644)
+	if isSignOnly {
+		// --- SIGN ONLY MODE (Detached Signature) ---
+		signHandle, err := m.pgp.Sign().
+			SigningKey(signKey).
+			Detached().
+			New()
+		if err != nil { return err }
+
+		// 1 implies Armored encoding (0=Bytes, 1=Armor, 2=Auto)
+		signature, err := signHandle.Sign(data, 1) 
+		if err != nil { return err }
+
+		return os.WriteFile(filepath.Join(targetDir, baseName+".sig"), signature, 0644)
+
+	} else {
+		// --- ENCRYPT (+ Optional Sign) MODE ---
+		builder := m.pgp.Encryption().Recipient(foundKey)
+		if signKey != nil {
+			builder = builder.SigningKey(signKey)
+		}
+
+		encryptionHandle, err := builder.New()
+		if err != nil { return err }
+
+		pgpMessage, err := encryptionHandle.Encrypt(data)
+		if err != nil { return err }
+
+		armored, err := pgpMessage.Armor()
+		if err != nil { return err }
+		
+		return os.WriteFile(filepath.Join(targetDir, baseName+".pgp"), []byte(armored), 0644)
+	}
 }
 
 // EncryptFileSymmetric encrypts a file using a passphrase (symmetric encryption).
-func (m *PGPManager) EncryptFileSymmetric(inputFile, password string) error {
+func (m *PGPManager) EncryptFileSymmetric(inputFile, password, outputDir string) error {
 	encryptionHandle, err := m.pgp.Encryption().
 		Password([]byte(password)).
 		New()
@@ -269,7 +341,13 @@ func (m *PGPManager) EncryptFileSymmetric(inputFile, password string) error {
 	armored, err := pgpMessage.Armor()
 	if err != nil { return err }
 
-	return os.WriteFile(inputFile+".pgp", []byte(armored), 0644)
+	targetDir := filepath.Dir(inputFile)
+	if outputDir != "" {
+		targetDir = outputDir
+	}
+	baseName := filepath.Base(inputFile)
+
+	return os.WriteFile(filepath.Join(targetDir, baseName+".pgp"), []byte(armored), 0644)
 }
 
 // findKeyFile locates the file path for a given key ID within the keyring directory.
@@ -283,96 +361,148 @@ func findKeyFile(keyID string) (string, error) {
 	return "", fmt.Errorf("key file not found for ID: %s", keyID)
 }
 
-// decryptBytes decrypts binary data using either a passphrase or a private key.
-// It handles loading and unlocking private keys from disk if required.
-func (m *PGPManager) decryptBytes(ciphertext []byte, passphrase, keySelector string) ([]byte, error) {
+// decryptAndVerify decrypts data and automatically verifies signatures using the loaded keyring.
+// Returns the plaintext bytes and a formatted status string describing the signature status.
+func (m *PGPManager) decryptAndVerify(ciphertext []byte, passphrase, keyID string) ([]byte, string, error) {
 	// Symmetric decryption
-	if keySelector == "" {
+	if keyID == "" {
 		decHandle, err := m.pgp.Decryption().Password([]byte(passphrase)).New()
-		if err != nil { return nil, err }
+		if err != nil { return nil, "", err }
 		
+		// 0 represents 'Bytes' (binary) encoding in gopenpgp if constants.Bytes is missing
 		msg, err := decHandle.Decrypt(ciphertext, 0)
 		if err != nil {
-			return nil, fmt.Errorf("symmetric decryption failed: %v", err)
+			return nil, "", fmt.Errorf("symmetric decryption failed: %v", err)
 		}
-		return msg.Bytes(), nil
+		return msg.Bytes(), "Symmetric (Password) - No Signature", nil
 	}
 
-	// Asymmetric decryption
-	targetID := ""
-	if idx := strings.LastIndex(keySelector, "["); idx != -1 {
-		if endIdx := strings.LastIndex(keySelector, "]"); endIdx != -1 && endIdx > idx {
-			targetID = keySelector[idx+1 : endIdx]
-		}
-	}
-
+	// Asymmetric decryption with automatic verification
 	// Find key in memory
 	var targetKey *crypto.Key
 	for _, key := range m.keyring.GetKeys() {
-		if key.GetHexKeyID() == targetID {
+		if key.GetHexKeyID() == keyID {
 			targetKey = key
 			break
 		}
 	}
 	if targetKey == nil {
-		return nil, fmt.Errorf("key not found in keyring")
+		return nil, "", fmt.Errorf("key not found in keyring")
 	}
 
 	// Load full private key from disk if memory only has the public part
 	if !targetKey.IsPrivate() {
-		keyPath, err := findKeyFile(targetID)
+		keyPath, err := findKeyFile(keyID)
 		if err != nil {
-			return nil, fmt.Errorf("private key file missing: %v", err)
+			return nil, "", fmt.Errorf("private key file missing: %v", err)
 		}
 		
 		fileData, err := os.ReadFile(keyPath)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		
 		fileKey, err := crypto.NewKeyFromArmored(string(fileData))
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		
 		targetKey = fileKey
 	}
 
+	// CRITICAL FIX: Check IsPrivate() BEFORE calling IsLocked()
+	// gopenpgp/v3 throws "public key cannot be lock" if IsLocked() is called on a public key.
+	if !targetKey.IsPrivate() {
+		return nil, "", fmt.Errorf("decryption requires a private key; selected key is public only")
+	}
+
 	// Unlock key if needed
 	isLocked, err := targetKey.IsLocked()
-	if err != nil { return nil, err }
+	if err != nil { return nil, "", err }
 
 	if isLocked {
-		if passphrase == "" { return nil, fmt.Errorf("passphrase required") }
+		if passphrase == "" { return nil, "", fmt.Errorf("passphrase required") }
 		targetKey, err = targetKey.Unlock([]byte(passphrase))
-		if err != nil { return nil, fmt.Errorf("incorrect passphrase") }
+		if err != nil { return nil, "", fmt.Errorf("incorrect passphrase") }
 	}
 
-	if !targetKey.IsPrivate() {
-		return nil, fmt.Errorf("decryption requires a private key")
-	}
+	// Create Decryption Handle with Verification Keys (Entire Keyring)
+	decHandle, err := m.pgp.Decryption().
+		DecryptionKey(targetKey).
+		VerificationKeys(m.keyring).
+		New()
+	if err != nil { return nil, "", err }
 
-	decHandle, err := m.pgp.Decryption().DecryptionKey(targetKey).New()
-	if err != nil { return nil, err }
-
+	// Use 0 for Bytes encoding
 	decrypted, err := decHandle.Decrypt(ciphertext, 0)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return decrypted.Bytes(), nil
+	// Check Verification Result
+	verifyStatus := "No Signature Found."
+	
+	// 'decrypted.VerifyResult' is a field, not a method. Access it directly.
+	res := decrypted.VerifyResult
+	
+	if res.SignatureError() == nil && len(res.Signatures) > 0 {
+		// Valid Signature - Try to find who signed it
+		signerID := res.SignedByKeyIdHex()
+		signerName := "Unknown ID " + signerID
+		
+		// Lookup friendly name in keyring
+		for _, k := range m.keyring.GetKeys() {
+			if k.GetHexKeyID() == signerID {
+				if ent := k.GetEntity(); ent != nil {
+					_, id := ent.PrimaryIdentity(time.Now(), nil)
+					if id != nil && id.UserId != nil {
+						signerName = fmt.Sprintf("%s <%s>", id.UserId.Name, id.UserId.Email)
+					}
+				}
+			}
+		}
+		verifyStatus = fmt.Sprintf("✅ Valid Signature from: %s", signerName)
+	} else if err := res.SignatureError(); err != nil {
+		verifyStatus = fmt.Sprintf("❌ Invalid Signature: %v", err)
+	}
+
+	return decrypted.Bytes(), verifyStatus, nil
 }
 
-// decryptFile reads a file and decrypts its content to a .decrypted output file.
-func (m *PGPManager) decryptFile(encryptedFile, passphrase, keySelector string) error {
+// decryptFile reads a file and decrypts its content to an output file.
+// If outputDir is empty, it saves to the same directory as the encrypted file.
+// Returns the verification status string.
+func (m *PGPManager) decryptFile(encryptedFile, passphrase, keyID, outputDir string) (string, error) {
 	data, err := os.ReadFile(encryptedFile)
-	if err != nil { return err }
+	if err != nil { return "", err }
 	
-	plaintext, err := m.decryptBytes(data, passphrase, keySelector)
-	if err != nil { return err }
+	plaintext, verifyStatus, err := m.decryptAndVerify(data, passphrase, keyID)
+	if err != nil { return "", err }
 	
-	outputFile := strings.TrimSuffix(encryptedFile, filepath.Ext(encryptedFile)) + ".decrypted"
-	return os.WriteFile(outputFile, plaintext, 0644)
+	// Determine output path
+	baseName := filepath.Base(encryptedFile)
+	// Strip known extensions
+	exts := []string{".pgp", ".gpg", ".asc", ".enc"}
+	outName := baseName
+	for _, ext := range exts {
+		if strings.HasSuffix(strings.ToLower(baseName), ext) {
+			outName = baseName[:len(baseName)-len(ext)]
+			break
+		}
+	}
+	// Fallback if no extension matched or name collision (simple append)
+	if outName == baseName {
+		outName += ".decrypted"
+	}
+
+	targetDir := filepath.Dir(encryptedFile)
+	if outputDir != "" {
+		targetDir = outputDir
+	}
+	
+	outputFile := filepath.Join(targetDir, outName)
+	err = os.WriteFile(outputFile, plaintext, 0644)
+	return verifyStatus, err
 }
 
 // exportKey exports a public or private key to a file.
@@ -430,6 +560,15 @@ func (m *PGPManager) importKey(keyFile string) error {
 		key, err = crypto.NewKey(data)
 		if err != nil {
 			return fmt.Errorf("invalid key format: %v", err)
+		}
+	}
+
+	// CHECK FOR DUPLICATES
+	// Using GetKeyID (uint64) instead of GetHexKeyID (string) as requested
+	newID := key.GetKeyID()
+	for _, k := range m.keyring.GetKeys() {
+		if k.GetKeyID() == newID {
+			return fmt.Errorf("key with ID %X already exists in keyring", newID)
 		}
 	}
 

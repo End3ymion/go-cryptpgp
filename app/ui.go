@@ -2,8 +2,10 @@ package app
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 )
@@ -21,6 +23,60 @@ func (m *PGPManager) showDialog(msgType gtk.MessageType, message string) {
 		dialog.Destroy()
 	})
 	dialog.Show()
+}
+
+// Helper to prompt for a password.
+// This function must be called from a goroutine, NOT the main thread.
+func (m *PGPManager) promptPassword(title string) (string, bool) {
+	type result struct {
+		pass string
+		ok   bool
+	}
+	resChan := make(chan result)
+
+	// Schedule UI operations on the main thread
+	glib.IdleAdd(func() {
+		dialog := gtk.NewDialog()
+		dialog.SetTitle(title)
+		dialog.SetTransientFor(m.window)
+		dialog.SetModal(true)
+
+		contentArea := dialog.ContentArea()
+		contentArea.SetMarginStart(20)
+		contentArea.SetMarginEnd(20)
+		contentArea.SetMarginTop(20)
+		contentArea.SetMarginBottom(20)
+
+		label := gtk.NewLabel("Enter Passphrase:")
+		entry := gtk.NewEntry()
+		entry.SetVisibility(false)
+		entry.SetActivatesDefault(true)
+
+		contentArea.Append(label)
+		contentArea.Append(entry)
+
+		dialog.AddButton("Cancel", int(gtk.ResponseCancel))
+		dialog.AddButton("OK", int(gtk.ResponseOK))
+		dialog.SetDefaultResponse(int(gtk.ResponseOK))
+
+		// Handle response
+		dialog.ConnectResponse(func(responseId int) {
+			pass := ""
+			ok := false
+			if responseId == int(gtk.ResponseOK) {
+				pass = entry.Text()
+				ok = true
+			}
+			dialog.Destroy()
+			resChan <- result{pass, ok}
+		})
+
+		dialog.Show()
+	})
+
+	// Block here (in the worker goroutine) until the UI thread sends the result
+	res := <-resChan
+	return res.pass, res.ok
 }
 
 // ---------------------------------------------------------
@@ -76,6 +132,7 @@ func (m *PGPManager) createKeyGenTab() {
 	validCombo.AppendText("No Expiration")
 	validCombo.AppendText("1 Year")
 	validCombo.AppendText("2 Years")
+	validCombo.AppendText("3 Years")
 	validCombo.AppendText("Expired (Test: Yesterday)")
 	validCombo.SetActive(0)
 	validBox.Append(validLabel)
@@ -106,6 +163,8 @@ func (m *PGPManager) createKeyGenTab() {
 		case 2:
 			lifetime = 31536000 * 2
 		case 3:
+			lifetime = 31536000 * 3
+		case 4:
 			lifetime = -1
 		}
 
@@ -220,7 +279,10 @@ func (m *PGPManager) createKeyListTab() {
 		}
 
 		if isLocked {
-			m.showDialog(gtk.MessageWarning, "Exporting locked keys requires unlocked keyring (Not implemented in this port).")
+			// Locked keys require unlock which we can't easily do in this main thread callback without freezing
+			// or re-architecting to spawn a goroutine for every button click. 
+			// For simplicity in this demo, we warn.
+			m.showDialog(gtk.MessageWarning, "Exporting locked private keys is not fully supported in this demo UI.")
 			return
 		}
 
@@ -323,7 +385,19 @@ func (m *PGPManager) refreshKeyList() {
 
 				creation := entity.PrimaryKey.CreationTime
 				createdStr := creation.Format("02 Jan 2006")
-				dateInfo = fmt.Sprintf("Created: %s", createdStr)
+				
+				// Calculate Expiry
+				expiryStr := "Never"
+				sig, _ := entity.PrimarySelfSignature(time.Time{}, nil)
+				if sig != nil && sig.KeyLifetimeSecs != nil {
+					secs := *sig.KeyLifetimeSecs
+					if secs != 0 {
+						expiryTime := creation.Add(time.Duration(secs) * time.Second)
+						expiryStr = expiryTime.Format("02 Jan 2006")
+					}
+				}
+				
+				dateInfo = fmt.Sprintf("Created: %s -> %s", createdStr, expiryStr)
 			}
 
 			keyID := key.GetHexKeyID()
@@ -372,79 +446,322 @@ func (m *PGPManager) createEncryptTab() {
 	box.SetMarginBottom(20)
 
 	label := gtk.NewLabel("Encrypt File")
-	label.SetMarkup("<b>Encrypt File</b>")
+	label.SetMarkup("<b>Encrypt / Sign File</b>")
 	box.Append(label)
 
-	fileEntry := m.createLabeledEntry(box, "Input File:")
-
-	symCheck := gtk.NewCheckButtonWithLabel("Password Only (Symmetric)")
-	box.Append(symCheck)
-
-	recipientCombo := m.createLabeledCombo(box, "Recipient:")
-	passwordEntry := m.createLabeledEntry(box, "Password:")
-
-	// Store parent boxes for visibility toggling
-	var pParentBox *gtk.Box
-	var rParentBox *gtk.Box
+	// -- Multiple File Selection --
+	fileList := gtk.NewListBox()
+	fileList.SetSelectionMode(gtk.SelectionNone)
+	fileList.SetSizeRequest(-1, 150)
 	
-	if w := passwordEntry.Parent(); w != nil {
-		if box, ok := w.(*gtk.Box); ok {
-			pParentBox = box
-			pParentBox.SetVisible(false)
-		}
-	}
+	scrolled := gtk.NewScrolledWindow()
+	scrolled.SetChild(fileList)
+	scrolled.SetVExpand(true)
 	
-	if w := recipientCombo.Parent(); w != nil {
-		if box, ok := w.(*gtk.Box); ok {
-			rParentBox = box
+	// Frame for file list
+	listFrame := gtk.NewFrame("Selected Files")
+	listFrame.SetChild(scrolled)
+	box.Append(listFrame)
+
+	// File Buttons
+	fileBtnBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	browseBtn := gtk.NewButtonWithLabel("Add Files...")
+	clearBtn := gtk.NewButtonWithLabel("Clear List")
+	fileBtnBox.Append(browseBtn)
+	fileBtnBox.Append(clearBtn)
+	box.Append(fileBtnBox)
+
+	// Store selected paths
+	var selectedFiles []string
+
+	// Function to remove a specific file
+	removeFile := func(targetPath string, row *gtk.ListBoxRow) {
+		// Update selectedFiles slice
+		for i, path := range selectedFiles {
+			if path == targetPath {
+				selectedFiles = append(selectedFiles[:i], selectedFiles[i+1:]...)
+				break
+			}
 		}
+		// Remove from UI
+		fileList.Remove(row)
 	}
 
-	symCheck.ConnectToggled(func() {
-		isSymmetric := symCheck.Active()
-		if rParentBox != nil {
-			rParentBox.SetVisible(!isSymmetric)
-		}
-		if pParentBox != nil {
-			pParentBox.SetVisible(isSymmetric)
-		}
-	})
-
-	browseBtn := gtk.NewButtonWithLabel("Browse...")
 	browseBtn.ConnectClicked(func() {
-		dialog := gtk.NewFileChooserNative("Select File", m.window, gtk.FileChooserActionOpen, "Open", "Cancel")
+		dialog := gtk.NewFileChooserNative("Select Files", m.window, gtk.FileChooserActionOpen, "Add", "Cancel")
+		dialog.SetSelectMultiple(true) // ENABLE MULTI-SELECTION
+
 		dialog.ConnectResponse(func(resp int) {
 			if resp == int(gtk.ResponseAccept) {
-				fileEntry.SetText(dialog.File().Path())
+				// Iterate over selected files from the list model
+				filesList := dialog.Files()
+				var i uint
+				for i = 0; i < filesList.NItems(); i++ {
+					obj := filesList.Item(i)
+					if fileObj, ok := obj.Cast().(*gio.File); ok {
+						path := fileObj.Path()
+						// Avoid duplicates in the list
+						alreadyExists := false
+						for _, existing := range selectedFiles {
+							if existing == path {
+								alreadyExists = true
+								break
+							}
+						}
+						
+						if !alreadyExists {
+							selectedFiles = append(selectedFiles, path)
+							
+							// Create Row with Label and Remove Button
+							row := gtk.NewListBoxRow()
+							rowBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+							
+							rowLabel := gtk.NewLabel(path)
+							rowLabel.SetHAlign(gtk.AlignStart)
+							rowLabel.SetHExpand(true)
+							rowLabel.SetMarginStart(5)
+							
+							removeBtn := gtk.NewButtonWithLabel("✖") // Small remove button
+							removeBtn.SetMarginEnd(5)
+							// Capture path and row for removal closure
+							p := path
+							r := row
+							removeBtn.ConnectClicked(func() {
+								removeFile(p, r)
+							})
+
+							rowBox.Append(rowLabel)
+							rowBox.Append(removeBtn)
+							row.SetChild(rowBox)
+							fileList.Append(row)
+						}
+					}
+				}
 			}
 			dialog.Destroy()
 		})
 		dialog.Show()
 	})
-	box.Append(browseBtn)
 
-	encryptBtn := gtk.NewButtonWithLabel("Encrypt")
-	encryptBtn.ConnectClicked(func() {
-		file := fileEntry.Text()
-		var err error
-
-		if symCheck.Active() {
-			pass := passwordEntry.Text()
-			err = m.EncryptFileSymmetric(file, pass)
-		} else {
-			rcpt := recipientCombo.ActiveText()
-			err = m.encryptFile(file, rcpt)
-		}
-
-		if err != nil {
-			m.showDialog(gtk.MessageError, "Error: "+err.Error())
-		} else {
-			m.showDialog(gtk.MessageInfo, "File Encrypted Successfully!")
+	clearBtn.ConnectClicked(func() {
+		selectedFiles = []string{}
+		for {
+			child := fileList.FirstChild()
+			if child == nil { break }
+			fileList.Remove(child)
 		}
 	})
-	box.Append(encryptBtn)
 
-	lbl := gtk.NewLabel("Encrypt")
+	// -- Output Directory Selection --
+	outDirBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	outDirEntry := gtk.NewEntry()
+	outDirEntry.SetPlaceholderText("Output Directory (Optional - Default: Input Dir)")
+	outDirEntry.SetHExpand(true)
+	
+	outDirBtn := gtk.NewButtonWithLabel("Select Output Dir...")
+	outDirBtn.ConnectClicked(func() {
+		dialog := gtk.NewFileChooserNative("Select Output Directory", m.window, gtk.FileChooserActionSelectFolder, "Select", "Cancel")
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseAccept) {
+				outDirEntry.SetText(dialog.File().Path())
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
+	})
+	
+	outDirBox.Append(gtk.NewLabel("Output:"))
+	outDirBox.Append(outDirEntry)
+	outDirBox.Append(outDirBtn)
+	box.Append(outDirBox)
+
+	// -- Options Group --
+	optsFrame := gtk.NewFrame("Encryption Options")
+	optsBox := gtk.NewBox(gtk.OrientationVertical, 5)
+	optsBox.SetMarginStart(10); optsBox.SetMarginEnd(10)
+	optsBox.SetMarginTop(5); optsBox.SetMarginBottom(5)
+	optsFrame.SetChild(optsBox)
+	box.Append(optsFrame)
+
+	// Helper to create checkbox + widget row
+	createOptionRow := func(label string, widget gtk.Widgetter) *gtk.CheckButton {
+		row := gtk.NewBox(gtk.OrientationHorizontal, 10)
+		check := gtk.NewCheckButtonWithLabel(label)
+		
+		row.Append(check)
+		
+		// If widget is provided, append it
+		if widget != nil {
+			// Cast to widget to append
+			row.Append(widget)
+		}
+		
+		optsBox.Append(row)
+		return check
+	}
+
+	// 1. Encrypt for Others
+	recipientCombo := m.createLabeledCombo(nil, "") 
+	recipientCombo = gtk.NewComboBoxText()
+	m.keyCombos = append(m.keyCombos, recipientCombo)
+	m.refreshCombo(recipientCombo)
+	encryptOthersCheck := createOptionRow("Encrypt for Others:", recipientCombo)
+
+	// 2. Encrypt for Me
+	myKeyCombo := gtk.NewComboBoxText()
+	m.keyCombos = append(m.keyCombos, myKeyCombo)
+	m.refreshCombo(myKeyCombo)
+	encryptMeCheck := createOptionRow("Encrypt for Me:", myKeyCombo)
+
+	// 3. Sign
+	signKeyCombo := gtk.NewComboBoxText()
+	m.keyCombos = append(m.keyCombos, signKeyCombo)
+	m.refreshCombo(signKeyCombo)
+	signCheck := createOptionRow("Sign with Key:", signKeyCombo)
+
+	// 4. Symmetric
+	symmetricCheck := createOptionRow("Symmetric Encryption (Password Prompt)", nil)
+
+	// UI Update Logic
+	updateUI := func() {
+		// Encrypt Others
+		isEncryptOthers := encryptOthersCheck.Active()
+		recipientCombo.SetSensitive(isEncryptOthers)
+
+		// Encrypt Me
+		isEncryptMe := encryptMeCheck.Active()
+		myKeyCombo.SetSensitive(isEncryptMe)
+
+		// Sign
+		isSign := signCheck.Active()
+		signKeyCombo.SetSensitive(isSign)
+	}
+
+	// Connect Signals
+	encryptOthersCheck.ConnectToggled(updateUI)
+	encryptMeCheck.ConnectToggled(updateUI)
+	signCheck.ConnectToggled(updateUI)
+	symmetricCheck.ConnectToggled(updateUI)
+
+	// Initial State
+	encryptOthersCheck.SetActive(true)
+	updateUI()
+
+	actionBtn := gtk.NewButtonWithLabel("Execute Batch")
+	actionBtn.ConnectClicked(func() {
+		if len(selectedFiles) == 0 {
+			m.showDialog(gtk.MessageError, "Please select at least one input file.")
+			return
+		}
+
+		outputDir := outDirEntry.Text()
+		isEncryptOthers := encryptOthersCheck.Active()
+		isEncryptMe := encryptMeCheck.Active()
+		isSign := signCheck.Active()
+		isSymmetric := symmetricCheck.Active()
+
+		if !isEncryptOthers && !isEncryptMe && !isSign && !isSymmetric {
+			m.showDialog(gtk.MessageError, "Please select at least one operation.")
+			return
+		}
+
+		if isEncryptOthers && recipientCombo.ActiveID() == "" {
+			m.showDialog(gtk.MessageError, "Please select a recipient.")
+			return
+		}
+		if isEncryptMe && myKeyCombo.ActiveID() == "" {
+			m.showDialog(gtk.MessageError, "Please select your public key.")
+			return
+		}
+		if isSign && signKeyCombo.ActiveID() == "" {
+			m.showDialog(gtk.MessageError, "Please select a signing key.")
+			return
+		}
+
+		// Capture needed data from UI before goroutine
+		rcptID := ""
+		if isEncryptOthers {
+			rcptID = recipientCombo.ActiveID()
+		} else if isEncryptMe {
+			rcptID = myKeyCombo.ActiveID()
+		}
+		
+		var signID string
+		if isSign {
+			signID = signKeyCombo.ActiveID()
+		}
+
+		actionBtn.SetSensitive(false)
+
+		// Copy file list to avoid race conditions
+		filesToProcess := make([]string, len(selectedFiles))
+		copy(filesToProcess, selectedFiles)
+
+		go func() {
+			defer glib.IdleAdd(func() { actionBtn.SetSensitive(true) })
+
+			var pass string
+			var ok bool
+
+			// Get password for Symmetric if needed
+			if isSymmetric {
+				pass, ok = m.promptPassword("Enter Symmetric Password")
+				if !ok {
+					return // User cancelled
+				}
+			}
+
+			// Get password for Signing Key if needed
+			var signPass string
+			if isSign {
+				isPrivate, isLocked, _ := m.GetKeyStatus(signID)
+				if isPrivate && isLocked {
+					signPass, ok = m.promptPassword("Enter Passphrase for Signing Key")
+					if !ok {
+						return // User cancelled
+					}
+				}
+			}
+
+			var errs []string
+			successCount := 0
+
+			for _, file := range filesToProcess {
+				var err error
+				if isSymmetric && !isEncryptOthers && !isEncryptMe && !isSign {
+					err = m.EncryptFileSymmetric(file, pass, outputDir)
+				} else {
+					err = m.encryptFile(file, rcptID, signID, signPass, outputDir)
+				}
+
+				if err != nil {
+					errs = append(errs, fmt.Sprintf("%s: %v", file, err))
+				} else {
+					successCount++
+				}
+			}
+			
+			glib.IdleAdd(func() {
+				if len(errs) > 0 {
+					msg := fmt.Sprintf("Processed %d/%d files.\n\nErrors:\n%s", 
+						successCount, len(filesToProcess), strings.Join(errs, "\n"))
+					m.showDialog(gtk.MessageError, msg)
+				} else {
+					m.showDialog(gtk.MessageInfo, fmt.Sprintf("Successfully processed %d files!", successCount))
+					// Clear list on success
+					selectedFiles = []string{}
+					for {
+						child := fileList.FirstChild()
+						if child == nil { break }
+						fileList.Remove(child)
+					}
+				}
+			})
+		}()
+	})
+	box.Append(actionBtn)
+
+	lbl := gtk.NewLabel("Encrypt/Sign")
 	m.notebook.AppendPage(box, lbl)
 }
 
@@ -459,22 +776,136 @@ func (m *PGPManager) createDecryptTab() {
 	box.SetMarginTop(20)
 	box.SetMarginBottom(20)
 
-	label := gtk.NewLabel("Decrypt File")
-	label.SetMarkup("<b>Decrypt File</b>")
+	label := gtk.NewLabel("Decrypt & Verify")
+	label.SetMarkup("<b>Decrypt & Verify</b>")
 	box.Append(label)
 
-	fileEntry := m.createLabeledEntry(box, "Encrypted File:")
+	// -- Multiple File Selection --
+	fileList := gtk.NewListBox()
+	fileList.SetSelectionMode(gtk.SelectionNone)
+	fileList.SetSizeRequest(-1, 150)
+	
+	scrolled := gtk.NewScrolledWindow()
+	scrolled.SetChild(fileList)
+	scrolled.SetVExpand(true)
+	
+	listFrame := gtk.NewFrame("Encrypted Files")
+	listFrame.SetChild(scrolled)
+	box.Append(listFrame)
+
+	// File Buttons
+	fileBtnBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	browseBtn := gtk.NewButtonWithLabel("Add Encrypted...")
+	clearBtn := gtk.NewButtonWithLabel("Clear List")
+	fileBtnBox.Append(browseBtn)
+	fileBtnBox.Append(clearBtn)
+	box.Append(fileBtnBox)
+
+	var selectedFiles []string
+
+	// Function to remove a specific file
+	removeFile := func(targetPath string, row *gtk.ListBoxRow) {
+		for i, path := range selectedFiles {
+			if path == targetPath {
+				selectedFiles = append(selectedFiles[:i], selectedFiles[i+1:]...)
+				break
+			}
+		}
+		fileList.Remove(row)
+	}
+
+	browseBtn.ConnectClicked(func() {
+		dialog := gtk.NewFileChooserNative("Select Encrypted", m.window, gtk.FileChooserActionOpen, "Add", "Cancel")
+		dialog.SetSelectMultiple(true) // ENABLE MULTI-SELECTION
+
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseAccept) {
+				// Iterate over selected files from the list model
+				filesList := dialog.Files()
+				var i uint
+				for i = 0; i < filesList.NItems(); i++ {
+					obj := filesList.Item(i)
+					if fileObj, ok := obj.Cast().(*gio.File); ok {
+						path := fileObj.Path()
+						// Avoid duplicates in the list
+						alreadyExists := false
+						for _, existing := range selectedFiles {
+							if existing == path {
+								alreadyExists = true
+								break
+							}
+						}
+						
+						if !alreadyExists {
+							selectedFiles = append(selectedFiles, path)
+							
+							row := gtk.NewListBoxRow()
+							rowBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+							
+							lbl := gtk.NewLabel(path)
+							lbl.SetHAlign(gtk.AlignStart)
+							lbl.SetHExpand(true)
+							lbl.SetMarginStart(5)
+							
+							removeBtn := gtk.NewButtonWithLabel("✖") 
+							removeBtn.SetMarginEnd(5)
+							
+							p := path
+							r := row
+							removeBtn.ConnectClicked(func() {
+								removeFile(p, r)
+							})
+
+							rowBox.Append(lbl)
+							rowBox.Append(removeBtn)
+							row.SetChild(rowBox)
+							fileList.Append(row)
+						}
+					}
+				}
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
+	})
+
+	clearBtn.ConnectClicked(func() {
+		selectedFiles = []string{}
+		for {
+			child := fileList.FirstChild()
+			if child == nil { break }
+			fileList.Remove(child)
+		}
+	})
+
+	// -- Output Directory Selection --
+	outDirBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	outDirEntry := gtk.NewEntry()
+	outDirEntry.SetPlaceholderText("Output Directory (Optional - Default: Input Dir)")
+	outDirEntry.SetHExpand(true)
+	
+	outDirBtn := gtk.NewButtonWithLabel("Select Output Dir...")
+	outDirBtn.ConnectClicked(func() {
+		dialog := gtk.NewFileChooserNative("Select Output Directory", m.window, gtk.FileChooserActionSelectFolder, "Select", "Cancel")
+		dialog.ConnectResponse(func(resp int) {
+			if resp == int(gtk.ResponseAccept) {
+				outDirEntry.SetText(dialog.File().Path())
+			}
+			dialog.Destroy()
+		})
+		dialog.Show()
+	})
+	
+	outDirBox.Append(gtk.NewLabel("Output:"))
+	outDirBox.Append(outDirEntry)
+	outDirBox.Append(outDirBtn)
+	box.Append(outDirBox)
+
 	symCheck := gtk.NewCheckButtonWithLabel("Symmetric (Password Only)")
 	box.Append(symCheck)
 
-	keyCombo := m.createLabeledCombo(box, "My Key:")
-	passCheck := gtk.NewCheckButtonWithLabel("Key requires Passphrase")
-	passCheck.SetActive(true)
-	box.Append(passCheck)
-
-	passEntry := m.createLabeledEntry(box, "Passphrase / Password:")
-	passEntry.SetVisibility(false)
-
+	keyCombo := m.createLabeledCombo(box, "My Key (for decryption):")
+	
 	var kParentBox *gtk.Box
 	if w := keyCombo.Parent(); w != nil {
 		if box, ok := w.(*gtk.Box); ok {
@@ -487,47 +918,107 @@ func (m *PGPManager) createDecryptTab() {
 		if kParentBox != nil {
 			kParentBox.SetVisible(!isSym)
 		}
-		passCheck.SetVisible(!isSym)
 	})
 
-	passCheck.ConnectToggled(func() {
-		if !symCheck.Active() {
-			passEntry.SetSensitive(passCheck.Active())
-		}
-	})
-
-	browseBtn := gtk.NewButtonWithLabel("Browse...")
-	browseBtn.ConnectClicked(func() {
-		dialog := gtk.NewFileChooserNative("Select Encrypted", m.window, gtk.FileChooserActionOpen, "Open", "Cancel")
-		dialog.ConnectResponse(func(resp int) {
-			if resp == int(gtk.ResponseAccept) {
-				fileEntry.SetText(dialog.File().Path())
-			}
-			dialog.Destroy()
-		})
-		dialog.Show()
-	})
-	box.Append(browseBtn)
-
-	decryptBtn := gtk.NewButtonWithLabel("Decrypt")
+	decryptBtn := gtk.NewButtonWithLabel("Decrypt & Verify All")
 	decryptBtn.ConnectClicked(func() {
-		file := fileEntry.Text()
-		pass := passEntry.Text()
-		selector := ""
-		if !symCheck.Active() {
-			selector = keyCombo.ActiveText()
+		if len(selectedFiles) == 0 {
+			m.showDialog(gtk.MessageError, "Please select at least one file to decrypt.")
+			return
 		}
 
-		err := m.decryptFile(file, pass, selector)
-		if err != nil {
-			m.showDialog(gtk.MessageError, "Error: "+err.Error())
-		} else {
-			m.showDialog(gtk.MessageInfo, "File Decrypted Successfully!")
+		outputDir := outDirEntry.Text()
+		keyID := ""
+		isSym := symCheck.Active()
+		
+		if !isSym {
+			keyID = keyCombo.ActiveID()
 		}
+
+		decryptBtn.SetSensitive(false)
+
+		// Copy list
+		filesToProcess := make([]string, len(selectedFiles))
+		copy(filesToProcess, selectedFiles)
+
+		go func() {
+			defer glib.IdleAdd(func() { decryptBtn.SetSensitive(true) })
+
+			var pass string
+			var ok bool
+
+			needPass := false
+			if isSym {
+				needPass = true
+			} else {
+				// Check if private key is locked
+				isPrivate, isLocked, _ := m.GetKeyStatus(keyID)
+				if isPrivate && isLocked {
+					needPass = true
+				}
+			}
+
+			if needPass {
+				title := "Enter Decryption Password"
+				if !isSym {
+					title = "Enter Key Passphrase"
+				}
+				pass, ok = m.promptPassword(title)
+				if !ok {
+					return
+				}
+			}
+
+			var logs []string
+			
+			for _, file := range filesToProcess {
+				verifyMsg, err := m.decryptFile(file, pass, keyID, outputDir)
+				if err != nil {
+					logs = append(logs, fmt.Sprintf("❌ %s: Failed - %v", file, err))
+				} else {
+					logs = append(logs, fmt.Sprintf("✅ %s: Decrypted\n   (%s)", file, verifyMsg))
+				}
+			}
+			
+			glib.IdleAdd(func() {
+				resultText := strings.Join(logs, "\n\n")
+				
+				// Show results in a scrolled dialog if too long
+				dialog := gtk.NewDialog()
+				dialog.SetTitle("Decryption Results")
+				dialog.SetTransientFor(m.window)
+				dialog.SetDefaultSize(600, 400)
+				
+				content := dialog.ContentArea()
+				scrolled := gtk.NewScrolledWindow()
+				scrolled.SetVExpand(true)
+				
+				tv := gtk.NewTextView()
+				tv.SetEditable(false)
+				tv.Buffer().SetText(resultText)
+				
+				scrolled.SetChild(tv)
+				content.Append(scrolled)
+				
+				dialog.AddButton("Close", int(gtk.ResponseOK))
+				dialog.ConnectResponse(func(id int) {
+					dialog.Destroy()
+				})
+				dialog.Show()
+
+				// Clear input list on success
+				selectedFiles = []string{}
+				for {
+					child := fileList.FirstChild()
+					if child == nil { break }
+					fileList.Remove(child)
+				}
+			})
+		}()
 	})
 	box.Append(decryptBtn)
 
-	lbl := gtk.NewLabel("Decrypt")
+	lbl := gtk.NewLabel("Decrypt/Verify")
 	m.notebook.AppendPage(box, lbl)
 }
 
@@ -553,6 +1044,8 @@ func (m *PGPManager) createSendTab() {
 
 	recipientCombo := m.createLabeledCombo(formBox, "To (Select Key):")
 	subjectEntry := m.createLabeledEntry(formBox, "Subject:")
+
+	// -- Attachment UI Removed --
 
 	// Body Text Area
 	bodyLabel := gtk.NewLabel("Message Body:")
@@ -602,7 +1095,7 @@ func (m *PGPManager) createSendTab() {
 
 	sendBtn.ConnectClicked(func() {
 		// Get Data
-		rcptKey := recipientCombo.ActiveText()
+		rcptKeyID := recipientCombo.ActiveID()
 		subject := subjectEntry.Text()
 
 		buffer := bodyView.Buffer()
@@ -610,7 +1103,7 @@ func (m *PGPManager) createSendTab() {
 		end := buffer.EndIter()
 		body := buffer.Text(start, end, false)
 
-		if rcptKey == "" {
+		if rcptKeyID == "" {
 			m.showDialog(gtk.MessageError, "Please select a recipient key.")
 			return
 		}
@@ -619,7 +1112,7 @@ func (m *PGPManager) createSendTab() {
 
 		go func() {
 			// Encrypt is ALWAYS true for this tab
-			err := m.sendEmail(rcptKey, subject, body, true)
+			err := m.sendEmail(rcptKeyID, subject, body, true)
 			glib.IdleAdd(func() {
 				sendBtn.SetSensitive(true)
 				if err != nil {
@@ -646,7 +1139,7 @@ func (m *PGPManager) createSendTab() {
 func (m *PGPManager) createLabeledEntry(box *gtk.Box, labelText string) *gtk.Entry {
 	hbox := gtk.NewBox(gtk.OrientationHorizontal, 5)
 	label := gtk.NewLabel(labelText)
-	label.SetSizeRequest(100, -1)
+	label.SetSizeRequest(150, -1)
 	label.SetHAlign(gtk.AlignStart)
 	entry := gtk.NewEntry()
 	entry.SetHExpand(true)
@@ -660,14 +1153,16 @@ func (m *PGPManager) createLabeledEntry(box *gtk.Box, labelText string) *gtk.Ent
 func (m *PGPManager) createLabeledCombo(box *gtk.Box, labelText string) *gtk.ComboBoxText {
 	hbox := gtk.NewBox(gtk.OrientationHorizontal, 5)
 	label := gtk.NewLabel(labelText)
-	label.SetSizeRequest(100, -1)
+	label.SetSizeRequest(150, -1)
 	label.SetHAlign(gtk.AlignStart)
 	combo := gtk.NewComboBoxText()
 	combo.SetHExpand(true)
 
 	hbox.Append(label)
 	hbox.Append(combo)
-	box.Append(hbox)
+	if box != nil {
+		box.Append(hbox)
+	}
 
 	m.keyCombos = append(m.keyCombos, combo)
 	m.refreshCombo(combo)
@@ -680,14 +1175,24 @@ func (m *PGPManager) refreshCombo(c *gtk.ComboBoxText) {
 		return
 	}
 	for _, key := range m.keyring.GetKeys() {
+		name := ""
 		email := "unknown"
-		if key.GetEntity() != nil {
-			_, ident := key.GetEntity().PrimaryIdentity(time.Now(), nil)
+		
+		if entity := key.GetEntity(); entity != nil {
+			_, ident := entity.PrimaryIdentity(time.Now(), nil)
 			if ident != nil && ident.UserId != nil {
+				name = ident.UserId.Name
 				email = ident.UserId.Email
 			}
 		}
-		c.AppendText(fmt.Sprintf("%s [%s]", email, key.GetHexKeyID()))
+		
+		displayText := email
+		if name != "" {
+			displayText = fmt.Sprintf("%s <%s>", name, email)
+		}
+		
+		// Use ID as value, Display Text as label (without ID)
+		c.Append(key.GetHexKeyID(), displayText)
 	}
 	if m.keyring.CountEntities() > 0 {
 		c.SetActive(0)
