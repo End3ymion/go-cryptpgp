@@ -12,15 +12,19 @@ import (
 
 	"github.com/ProtonMail/gopenpgp/v3/crypto"
 	"github.com/joho/godotenv"
+	"github.com/zalando/go-keyring"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 )
 
-const tokenFile = "token.json"
+const (
+	keyringService = "PGPManagerApp"
+	keyringUser    = "gmail-oauth-token"
+)
 
-// AttemptSilentAuth tries to load a saved token from disk to authenticate
+// AttemptSilentAuth tries to load a saved token from the system keyring to authenticate
 // without opening a browser. Returns true if successful.
 func (m *PGPManager) AttemptSilentAuth() bool {
 	ctx := context.Background()
@@ -30,9 +34,9 @@ func (m *PGPManager) AttemptSilentAuth() bool {
 		return false
 	}
 
-	tok, err := m.tokenFromFile(tokenFile)
+	tok, err := m.tokenFromKeyring()
 	if err != nil {
-		fmt.Println("Silent Auth Failed: No valid token found.")
+		fmt.Println("Silent Auth Failed: No valid token found in keyring.")
 		return false
 	}
 
@@ -98,7 +102,10 @@ func (m *PGPManager) authenticateGmail() error {
 		return err
 	}
 
-	m.saveToken(tokenFile, tok)
+	// Save token to system keyring for future silent auth
+	if err := m.saveTokenToKeyring(tok); err != nil {
+		fmt.Printf("Warning: Failed to save token to keyring: %v\n", err)
+	}
 
 	client := config.Client(ctx, tok)
 	srv, err := gmail.NewService(ctx, option.WithHTTPClient(client))
@@ -188,24 +195,24 @@ func (m *PGPManager) getOAuthConfig() (*oauth2.Config, error) {
 	}, nil
 }
 
-func (m *PGPManager) saveToken(path string, token *oauth2.Token) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+// Helper: Save Token to System Keyring
+func (m *PGPManager) saveTokenToKeyring(token *oauth2.Token) error {
+	data, err := json.Marshal(token)
 	if err != nil {
-		fmt.Printf("Unable to cache oauth token: %v\n", err)
-		return
+		return err
 	}
-	defer f.Close()
-	json.NewEncoder(f).Encode(token)
+	return keyring.Set(keyringService, keyringUser, string(data))
 }
 
-func (m *PGPManager) tokenFromFile(file string) (*oauth2.Token, error) {
-	f, err := os.Open(file)
+// Helper: Load Token from System Keyring
+func (m *PGPManager) tokenFromKeyring() (*oauth2.Token, error) {
+	dataStr, err := keyring.Get(keyringService, keyringUser)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	
 	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
+	err = json.Unmarshal([]byte(dataStr), tok)
 	return tok, err
 }
 
